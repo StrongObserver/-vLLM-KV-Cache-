@@ -1,0 +1,29 @@
+# Reconstruction starting point, NOT the recovered historical tuned settings.
+# watermark, token budgets and prefill threshold require independent calibration.
+[serve]
+model = "Qwen/Qwen2.5-7B-Instruct"
+dtype = "bfloat16"
+tensor_parallel_size = 1
+pipeline_parallel_size = 1
+data_parallel_size = 1
+kv_cache_memory_bytes = 17179869184
+block_size = 16
+max_model_len = 16384
+max_num_seqs = 128
+max_num_batched_tokens = 2048
+max_num_scheduled_tokens = 2048
+long_prefill_token_threshold = 512
+scheduling_policy = "fcfs"
+enable_prefix_caching = true
+enable_chunked_prefill = true
+async_scheduling = false
+scheduler_reserve_full_isl = true
+watermark = 0.0
+stream_interval = 1
+host = "127.0.0.1"
+port = 8000
+
+[admission]
+window = 8
+bypass_limit = 8
+log_interval = 1000

@@ -248,6 +248,22 @@ class KVCacheManager:
         )
 
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
+        result = self.peek_computed_blocks(request)
+        self.publish_computed_block_events(request, result[0], result[1])
+        return result
+
+    def publish_computed_block_events(
+        self, request: Request, blocks: KVCacheBlocks, num_hits: int
+    ) -> None:
+        """Publish only after successful admission for window candidates."""
+        if (
+            num_hits > 0
+            and self.enable_kv_cache_events
+            and getattr(request, "kv_cache_report_mode", "incremental") == "full"
+        ):
+            self.coordinator.emit_cached_block_events(request, blocks.blocks)
+
+    def peek_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
@@ -284,15 +300,9 @@ class KVCacheManager:
             )
         )
 
-        # When kv_cache_report_mode is "full", emit BlockStored events
-        # for the reused prefix cache blocks so that external consumers
-        # (e.g. gateway) can learn about them.
-        if (
-            num_new_computed_tokens > 0
-            and self.enable_kv_cache_events
-            and getattr(request, "kv_cache_report_mode", "incremental") == "full"
-        ):
-            self.coordinator.emit_cached_block_events(request, computed_blocks)
+        # No cache events, refcount/LRU changes or statistics here. Purity
+        # is relied on only for the dense full-attention compatibility gate;
+        # other model families continue using the original public wrapper.
 
         # The junction to pin is where the lagging sparse-retention group stops
         # (``num_new_computed_tokens``) plus the uncached shared prefix -- i.e.

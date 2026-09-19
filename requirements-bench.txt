@@ -1,0 +1,3 @@
+# Optional client dependencies. Engine dependencies come from pinned vLLM.
+aiohttp>=3.10,<4
+transformers>=4.51,<5

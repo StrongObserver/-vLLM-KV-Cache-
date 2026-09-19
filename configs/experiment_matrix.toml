@@ -1,0 +1,33 @@
+# A declared search space and frozen comparison protocol; no measured winners.
+[calibration]
+seeds = [101, 103]
+watermarks = [0.0, 0.02, 0.05]
+token_budgets = [1024, 2048, 4096]
+long_prefill_thresholds = [512, 1024, 2048]
+reserve_full_isl = [false, true]
+windows = [4, 8, 16]
+bypass_limits = [4, 8, 16]
+
+[evaluation]
+seeds = [19, 23, 29]
+modes = ["fcfs", "window", "bounded"]
+duration_s = 1800
+deadline_s = 300
+rate_rps = 5
+window = 8
+bypass_limit = 8
+rotate_mode_order = true
+
+[controls]
+scenarios = ["mixed", "shared", "burst", "homogeneous"]
+rates_rps = [0.5, 5.0]
+kv_budgets_gib = [16, 32]
+
+[acceptance]
+min_goodput_gain_each_trace = 0.05
+max_long_output_completion_fraction_drop = 0.01
+max_long_output_mean_tpot_p99_increase_s = 0.002
+# Per-request budgets; these are not group P99 guarantees.
+short_input_ttft_s = 2.0
+long_input_ttft_s = 10.0
+tpot_s = 0.050

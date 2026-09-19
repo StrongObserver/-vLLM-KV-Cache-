@@ -39,6 +39,11 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+from vllm.v1.core.sched.kv_admission import AdmissionConfig, AdmissionPolicy
+from vllm.v1.core.sched.kv_admission.compat import (
+    request_is_eligible,
+    unsupported_reasons,
+)
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -316,6 +321,15 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_fine_grained_prefix_cache
             ),
         )
+        # KV admission extension: allocator arithmetic remains upstream-owned.
+        admission_config = AdmissionConfig.from_env()
+        reasons = unsupported_reasons(self)
+        self.kv_admission = AdmissionPolicy(admission_config, reasons)
+        if admission_config.mode != "fcfs" and reasons:
+            logger.warning(
+                "KV admission disabled; using original scheduler: %s",
+                "; ".join(reasons),
+            )
         # Bind after construction so connectors can access the cache manager.
         if self.connector is not None:
             self.connector.bind_kv_cache_manager(self.kv_cache_manager)
@@ -560,7 +574,13 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        admission_schedule_start_ns = time.perf_counter_ns()
         self.current_step += 1
+        # One cursor/budget for the entire step. A blocked dependency queue
+        # disables bypass so this extension cannot reorder across it.
+        admission_round = self.kv_admission.begin_round(
+            allow_scan=not self.skipped_waiting and not throttle_prefills
+        )
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -868,8 +888,24 @@ class Scheduler(SchedulerInterface):
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
 
-                request = request_queue.peek_request()
+                if admission_round.active:
+                    request_queue = self.waiting
+                    request = admission_round.next_candidate()
+                    if request is None:
+                        break
+                    if not request_is_eligible(request):
+                        admission_round.skip_candidate(request, "request_constraint")
+                        continue
+                else:
+                    request = request_queue.peek_request()
                 request_id = request.request_id
+                admission_query = (
+                    self.kv_admission.enabled
+                    and admission_round.allow_scan
+                    and request_queue is self.waiting
+                    and request_is_eligible(request)
+                )
+                pending_prefix_boundary = 0
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(
@@ -918,12 +954,23 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     did_prefix_cache_lookup = True
-                    (
-                        new_computed_blocks,
-                        num_new_local_computed_tokens,
-                        request.shared_prefix_boundary,
-                        hit_diverged,
-                    ) = self._get_local_prefix_cache_hit(request)
+                    if admission_query:
+                        # Fresh lookup immediately before this candidate's
+                        # allocation; no retained block IDs across commits.
+                        with self.kv_admission.metrics.measure("prefix_query"):
+                            (
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                                pending_prefix_boundary,
+                            ) = self.kv_cache_manager.peek_computed_blocks(request)
+                        hit_diverged = False
+                    else:
+                        (
+                            new_computed_blocks,
+                            num_new_local_computed_tokens,
+                            request.shared_prefix_boundary,
+                            hit_diverged,
+                        ) = self._get_local_prefix_cache_hit(request)
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -998,7 +1045,11 @@ class Scheduler(SchedulerInterface):
                         continue
 
                     # Track first scheduled prefill, not post-preemption repeat prefills
-                    if request.prefill_stats and request.num_preemptions <= 0:
+                    if (
+                        not admission_query
+                        and request.prefill_stats
+                        and request.num_preemptions <= 0
+                    ):
                         assert num_computed_tokens <= request.num_prompt_tokens
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
@@ -1074,8 +1125,11 @@ class Scheduler(SchedulerInterface):
                         not self.scheduler_config.enable_chunked_prefill
                         and num_new_tokens > request_token_budget
                     ):
-                        # If chunked_prefill is disabled,
-                        # we can stop the scheduling here.
+                        # Candidate-specific constraint consumes a window
+                        # position; the ordinary head keeps upstream behavior.
+                        if admission_round.active:
+                            admission_round.skip_candidate(request, "prefill_budget")
+                            continue
                         break
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
@@ -1157,19 +1211,20 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
-                new_blocks = self.kv_cache_manager.allocate_slots(
-                    request,
-                    num_new_tokens,
-                    num_new_computed_tokens=num_new_local_computed_tokens,
-                    new_computed_blocks=new_computed_blocks,
-                    num_lookahead_tokens=effective_lookahead_tokens,
-                    num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
-                    num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
-                    reserved_blocks=reserved_blocks,
-                    has_scheduled_reqs=bool(self.running),
-                )
+                with self.kv_admission.metrics.measure("waiting_allocate"):
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_new_computed_tokens=num_new_local_computed_tokens,
+                        new_computed_blocks=new_computed_blocks,
+                        num_lookahead_tokens=effective_lookahead_tokens,
+                        num_external_computed_tokens=num_external_computed_tokens,
+                        delay_cache_blocks=load_kv_async,
+                        num_encoder_tokens=num_encoder_tokens,
+                        full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                        reserved_blocks=reserved_blocks,
+                        has_scheduled_reqs=bool(self.running),
+                    )
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1178,7 +1233,29 @@ class Scheduler(SchedulerInterface):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if admission_round.reject_capacity(
+                        request, request_queue,
+                        can_start=(
+                            admission_query
+                            and not self.skipped_waiting
+                            and not step_skipped_waiting
+                        ),
+                    ):
+                        continue
                     break
+
+                # Publish candidate-only state after the allocator commits.
+                if admission_query:
+                    request.shared_prefix_boundary = pending_prefix_boundary
+                    self.kv_cache_manager.publish_computed_block_events(
+                        request, new_computed_blocks, num_new_local_computed_tokens
+                    )
+                    if request.prefill_stats and request.num_preemptions <= 0:
+                        request.prefill_stats.set(
+                            num_prompt_tokens=request.num_prompt_tokens,
+                            num_local_cached_tokens=num_new_local_computed_tokens,
+                            num_external_cached_tokens=0,
+                        )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1206,7 +1283,7 @@ class Scheduler(SchedulerInterface):
                         request, num_new_local_computed_tokens
                     )
 
-                request = request_queue.pop_request()
+                admission_round.remove_committed(request_queue, request)
                 if load_kv_async:
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
@@ -1264,6 +1341,7 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                admission_round.on_admitted(request)
                 if pad_spec_decode:
                     assert num_new_tokens == 1 + self.num_spec_tokens
                     scheduled_spec_decode_tokens[request_id] = [
@@ -1454,6 +1532,14 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        self.kv_admission.metrics.time_ns["schedule_total"] += (
+            time.perf_counter_ns() - admission_schedule_start_ns
+        )
+        self.kv_admission.metrics.log_if_due(
+            logger, self.current_step, self.kv_admission.config.log_interval,
+            self.kv_admission.config.mode if self.kv_admission.enabled
+            else "original_" + self.scheduler_config.policy,
+        )
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1491,6 +1577,7 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        self.kv_admission.on_preempt(request.request_id, request.num_computed_tokens)
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
@@ -1531,6 +1618,9 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         for req_id, num_scheduled_token in num_scheduled_tokens.items():
             request = self.requests[req_id]
+            self.kv_admission.on_scheduled(
+                req_id, request.num_computed_tokens, num_scheduled_token
+            )
             request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
@@ -2581,6 +2671,7 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        self.kv_admission.on_finish(request.request_id)
 
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
