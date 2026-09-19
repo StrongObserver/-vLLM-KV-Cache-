@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/vllm-project/vllm.git",
+  "commit": "fa008bdccf10f2f31f84553112a227cf1b8947d7",
+  "overlay_files": {
+    "vllm/v1/core/sched/scheduler.py": "e2174e860f45d266c9d92ac3c864e96a6419924d046d7aa39b63ae3d29a3c9a5",
+    "vllm/v1/core/kv_cache_manager.py": "231b334bf46168562cea512a377b62ecb7d11dd7d205060ccc37523e8d6bde6e"
+  }
+}
